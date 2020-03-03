@@ -4,11 +4,14 @@ import setuptools
 
 setuptools.setup(
     name='pyawslambda-utils',
+    version='1.0.0',
     py_modules=['pyawslambdautils'],
+    setup_requires=['botocore'],
     entry_points={
         'distutils.commands': [
-            ['aws_upload = pyawslambdautils.AwsLambdaUoload',
-             'aws_publish = pyawslambdautils.AwsLambdaPublish']
+            'awsupload = pyawslambdautils:AwsLambdaUoload',
+            'awspublish = pyawslambdautils:AwsLambdaPublish',
+            'awstest = pyawslambdautils:AwsLambdaTest'
         ]
     }
 )
