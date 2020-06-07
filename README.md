@@ -19,7 +19,7 @@ setup(
 
 Add AWS Lambda configure in setup.cfg:
 
-```
+```properties
 [tools:awslambda]
 # AWS Lambda runtime, can be py36, py37, py38
 runtime=py38
@@ -29,6 +29,7 @@ region=us-west-1
 name=MyAWSLambda
 # Test data for aws lambda
 testdata={"test": "payload"}
+
 
 [tools:awslambda-layers]
 py38_database=SQLAlchemy psycopg2_binary
