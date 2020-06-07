@@ -22,7 +22,7 @@ class AwsLambdaAbstractCommand(Command):
             raise Exception('Parameter name is missing')
 
 
-class AwsLambdaUoload(AwsLambdaAbstractCommand):
+class AwsLambdaUpload(AwsLambdaAbstractCommand):
     description = 'Upload aws lambda function packages'
 
     def run(self):
@@ -101,3 +101,98 @@ class AwsLambdaTest(AwsLambdaAbstractCommand):
         ret = client.invoke(FunctionName=self.name, InvocationType='RequestResponse', Payload=self.testdata.encode())
         print('HTTP Status Code: %s' % ret['ResponseMetadata']['HTTPStatusCode'])
         print(ret['Payload'].read())
+
+
+class AwsLambdaLayerBuilder(AwsLambdaAbstractCommand):
+    DOCKERFILE = '''
+FROM %(DOCKER_IMAGE_FROM)s AS build-stage
+RUN pip install --upgrade pip
+
+%(DOCKERFILE_PACKAGES_CMDS)s
+
+FROM scratch AS export-stage
+COPY --from=build-stage /tmp /
+'''
+
+    DOCKERFILE_PACKAGES_CMD = '''
+RUN mkdir /tmp/%(PKG_NAME)s
+RUN mkdir /tmp/%(PKG_NAME)s/python
+RUN pip3 install -t /tmp/%(PKG_NAME)s/python %(PACKAGES)s
+RUN cd /tmp/%(PKG_NAME)s/python && python3 -c 'import os; print(",".join(sorted([dir[:-10] for dir in os.listdir("/tmp/%(PKG_NAME)s/python") if dir.endswith(".dist-info")])))' > /tmp/%(PKG_NAME)s.txt && rm -rf bin *.dist-info
+'''
+
+    PY_VER = {
+        'py36': {'DOCKER_IMAGE_FROM': 'python:3.6', 'RUNTIME': 'python3.6'},
+        'py37': {'DOCKER_IMAGE_FROM': 'python:3.7', 'RUNTIME': 'python3.7'},
+        'py38': {'DOCKER_IMAGE_FROM': 'python:3.8', 'RUNTIME': 'python3.8'},
+    }
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.build_params = None
+        self.layers = None
+
+    def finalize_options(self):
+        super().finalize_options()
+        lambda_options = self.distribution.get_option_dict('tools:awslambda')
+
+        if 'runtime' not in lambda_options:
+            raise Exception('Parameter pyver is missing')
+        elif lambda_options['runtime'][1] not in self.PY_VER:
+            raise Exception('Parameter pyver is must be %s' % ', '.join(self.PY_VER.keys()))
+        else:
+            self.build_params = self.PY_VER[lambda_options['runtime'][1]].copy()
+
+        lambda_layers = self.distribution.get_option_dict('tools:awslambda-layers')
+        self.layers = [(layername, info[1]) for layername, info in lambda_layers.items()]
+
+    def create_dockerfile(self):
+        build_cmds = '\n'.join(
+            self.DOCKERFILE_PACKAGES_CMD % {
+                'PKG_NAME': layername,
+                'PACKAGES': packages,
+            }
+            for layername, packages in self.layers
+        )
+        return self.DOCKERFILE % {
+            'DOCKER_IMAGE_FROM': self.build_params['DOCKER_IMAGE_FROM'],
+            'DOCKERFILE_PACKAGES_CMDS': build_cmds
+        }
+
+    def run(self):
+        root_path = os.path.abspath('.')
+        package_path = os.path.join(root_path, 'dist', 'awslambdalayers')
+        if os.path.exists(package_path):
+            shutil.rmtree(package_path)
+        os.makedirs(package_path)
+
+        os.environ['DOCKER_BUILDKIT'] = '1'
+
+        proc = Popen(('docker', 'build', '--output', package_path, '-'), stdin=PIPE)
+        proc.communicate(self.create_dockerfile().encode())
+
+        if proc.returncode != 0:
+            raise RuntimeError('build return %s' % proc.returncode)
+
+        client = Session().create_client('lambda', region_name=self.region)
+        arns = []
+
+        for layername, packages in self.layers:
+            zip_filename = os.path.join(package_path, f'{layername}.zip')
+            os.chdir(os.path.join(package_path, layername))
+            self.make_archive(zip_filename[:-4], 'zip', None, '.')
+            with open(os.path.join(package_path, f'{layername}.txt'), 'r') as f:
+                description = f.read()
+            with open(os.path.join(package_path, f'{layername}.zip'), 'rb') as f:
+                zipbuf = f.read()
+
+            print(f'Uploading {layername} ...')
+            ret = client.publish_layer_version(
+                LayerName=layername,
+                Description=description,
+                Content={'ZipFile': zipbuf},
+                CompatibleRuntimes=[self.build_params['RUNTIME']]
+            )
+            arns.append(ret.get('LayerArn'))
+        for arn in arns:
+            print(f'Layer created for {arn}')
